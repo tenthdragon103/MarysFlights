@@ -1,0 +1,3 @@
+bodiesFile: solar_system.ini
+timeScale: 100000
+physicsStep: 10 # DO NOT TOUCH

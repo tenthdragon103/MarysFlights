@@ -61,6 +61,21 @@ add_executable(MarysFlights main.cpp
         physics/trajectory/TrajectoryResult.h
         agent/Integrator.cpp
         agent/Integrator.h
+        config/Config.cpp
+        config/Config.h
 )
+
+# copy configurations to target
+add_custom_command(TARGET MarysFlights POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+        "${CMAKE_CURRENT_SOURCE_DIR}/config/options.yml"
+        "$<TARGET_FILE_DIR:MarysFlights>/config/options.yml"
+)
+add_custom_command(TARGET MarysFlights POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/config/systems"
+        "$<TARGET_FILE_DIR:MarysFlights>/config/systems"
+)
+
 
 target_link_libraries(MarysFlights PRIVATE raylib)

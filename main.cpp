@@ -1,10 +1,12 @@
 #include "raylib.h"
+#include "config/Config.h"
 
 #include "simulation/Simulation.h"
 #include "graphics/Renderer.h"
 
 int main()
 {
+    Config::initialize();
     InitWindow(
         1280,
         720,

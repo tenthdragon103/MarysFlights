@@ -12,13 +12,14 @@
 #include "../physics/Integrator.h"
 #include "../physics/Acceleration.h"
 #include "../physics/Diagnostics.h"
+#include "../config/Config.h"
 
 Simulation::Simulation()
     : running(false),
       simulationTime(0.0),
-      timeScale(100000.0),
+      timeScale(Config::getTimeScale()),
       accumulator(0.0),
-      physicsStep(10.0),
+      physicsStep(Config::getPhysicsStep()),
       nextDiagnosticTime(0.0),
       epochJulianDate(0.0)
 {
@@ -29,14 +30,11 @@ void Simulation::startNew()
     simulationTime = 0.0;
     accumulator = 0.0;
     nextDiagnosticTime = 0.0;
-
-    std::string iniLocation = std::filesystem::current_path().string() + "/../config/solar_system.ini";
-    // alphacentauri.ini, solar_system.ini, 55cancri.ini, trappist.ini
-
+    
     epochJulianDate =
         InitialState::initialize(
             solarSystem,
-            iniLocation
+            Config::getBodiesFile()
         );
 
     Acceleration::calculate(
