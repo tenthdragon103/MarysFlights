@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <string>
 
 #include "rlgl.h"
 
@@ -230,6 +232,418 @@ int sphereDetail(
     return std::clamp(rings, 8, 48);
 }
 
+/*
+ * ----------------------------------------------------------------------
+ * Procedural surface textures
+ * ----------------------------------------------------------------------
+ *
+ * No texture assets are shipped or loaded from disk. Instead each body
+ * gets a small equirectangular texture generated once, from a value-noise
+ * fractal seeded from its name, and cached for the process lifetime
+ * (Renderer::getOrCreateTexture). This is not trying to be accurate to
+ * any real body's actual surface - it is there so a lit sphere reads as
+ * "a planet" instead of a flat-colored ball, with every body still
+ * visually distinct.
+ */
+
+std::uint32_t seedFromName(
+    const std::string& name
+)
+{
+    std::uint32_t hash = 2166136261u;
+
+    for (char c : name)
+    {
+        hash ^= static_cast<unsigned char>(c);
+        hash *= 16777619u;
+    }
+
+    return hash;
+}
+
+float hashNoise(
+    int x,
+    int y,
+    std::uint32_t seed
+)
+{
+    std::uint32_t h =
+        static_cast<std::uint32_t>(x) * 374761393u +
+        static_cast<std::uint32_t>(y) * 668265263u +
+        seed * 2654435761u;
+
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= (h >> 16);
+
+    return (h & 0xFFFFFFu) / static_cast<float>(0xFFFFFFu);
+}
+
+float smoothNoise(
+    float x,
+    float y,
+    std::uint32_t seed
+)
+{
+    const int xi = static_cast<int>(std::floor(x));
+    const int yi = static_cast<int>(std::floor(y));
+
+    const float xf = x - static_cast<float>(xi);
+    const float yf = y - static_cast<float>(yi);
+
+    const float v00 = hashNoise(xi,     yi,     seed);
+    const float v10 = hashNoise(xi + 1, yi,     seed);
+    const float v01 = hashNoise(xi,     yi + 1, seed);
+    const float v11 = hashNoise(xi + 1, yi + 1, seed);
+
+    const float u = xf * xf * (3.0f - 2.0f * xf);
+    const float v = yf * yf * (3.0f - 2.0f * yf);
+
+    const float a = v00 + u * (v10 - v00);
+    const float b = v01 + u * (v11 - v01);
+
+    return a + v * (b - a);
+}
+
+/*
+ * Fractal Brownian motion: several octaves of the noise above, each
+ * higher-frequency and lower-amplitude than the last. This is what
+ * turns smooth blobby noise into something that reads as terrain.
+ */
+float fbm(
+    float x,
+    float y,
+    std::uint32_t seed,
+    int octaves = 5
+)
+{
+    float total = 0.0f;
+    float amplitude = 0.5f;
+    float frequency = 1.0f;
+    float normalization = 0.0f;
+
+    for (int i = 0; i < octaves; ++i)
+    {
+        total +=
+            smoothNoise(
+                x * frequency,
+                y * frequency,
+                seed + static_cast<std::uint32_t>(i) * 101u
+            ) * amplitude;
+
+        normalization += amplitude;
+
+        amplitude *= 0.5f;
+        frequency *= 2.0f;
+    }
+
+    return total / normalization;
+}
+
+Color lerpColor(
+    Color a,
+    Color b,
+    float t
+)
+{
+    t = std::clamp(t, 0.0f, 1.0f);
+
+    return Color{
+        static_cast<unsigned char>(a.r + (b.r - a.r) * t),
+        static_cast<unsigned char>(a.g + (b.g - a.g) * t),
+        static_cast<unsigned char>(a.b + (b.b - a.b) * t),
+        255
+    };
+}
+
+/*
+ * Terrestrial-looking bodies: continents/highlands above a threshold,
+ * ocean-toned lowlands below it, and polar ice caps blended in near the
+ * top and bottom of the texture regardless of the underlying terrain.
+ */
+Image buildRockyImage(
+    Color base,
+    std::uint32_t seed
+)
+{
+    constexpr int width = 256;
+    constexpr int height = 128;
+
+    Color* pixels =
+        static_cast<Color*>(
+            RL_MALLOC(
+                static_cast<size_t>(width) *
+                static_cast<size_t>(height) *
+                sizeof(Color)
+            )
+        );
+
+    const Color highland = lerpColor(base, WHITE, 0.35f);
+    const Color lowland  = base;
+    const Color ocean    = lerpColor(base, Color{10, 30, 70, 255}, 0.6f);
+    const Color ice      = Color{235, 240, 245, 255};
+
+    for (int y = 0; y < height; ++y)
+    {
+        const float v = static_cast<float>(y) / height;
+        const float latitude = (v - 0.5f) * 2.0f;
+
+        for (int x = 0; x < width; ++x)
+        {
+            const float u = static_cast<float>(x) / width;
+
+            const float elevation =
+                fbm(u * 4.0f, v * 4.0f, seed, 5) * 0.7f +
+                fbm(u * 11.0f, v * 11.0f, seed + 777u, 3) * 0.3f;
+
+            Color color =
+                elevation > 0.52f
+                    ? lerpColor(
+                          lowland,
+                          highland,
+                          (elevation - 0.52f) / 0.48f
+                      )
+                    : lerpColor(
+                          ocean,
+                          lowland,
+                          elevation / 0.52f
+                      );
+
+            const float iceMask =
+                std::max(
+                    0.0f,
+                    (std::abs(latitude) - 0.78f) / 0.22f
+                );
+
+            color = lerpColor(color, ice, iceMask);
+
+            pixels[y * width + x] = color;
+        }
+    }
+
+    Image image{};
+    image.data = pixels;
+    image.width = width;
+    image.height = height;
+    image.mipmaps = 1;
+    image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+
+    return image;
+}
+
+/*
+ * Gas giants: horizontal bands, gently warped so they aren't perfectly
+ * straight, with a turbulence pass so the bands vary in width and blend
+ * into each other rather than looking like flat stripes.
+ */
+Image buildGasGiantImage(
+    Color base,
+    std::uint32_t seed
+)
+{
+    constexpr int width = 256;
+    constexpr int height = 128;
+
+    Color* pixels =
+        static_cast<Color*>(
+            RL_MALLOC(
+                static_cast<size_t>(width) *
+                static_cast<size_t>(height) *
+                sizeof(Color)
+            )
+        );
+
+    const Color bandLight = lerpColor(base, WHITE, 0.25f);
+    const Color bandDark  = lerpColor(base, Color{40, 20, 10, 255}, 0.35f);
+
+    for (int y = 0; y < height; ++y)
+    {
+        const float v = static_cast<float>(y) / height;
+
+        for (int x = 0; x < width; ++x)
+        {
+            const float u = static_cast<float>(x) / width;
+
+            const float warp =
+                fbm(u * 6.0f, v * 20.0f, seed, 4) * 0.06f;
+
+            const float band =
+                std::sin(
+                    (v + warp) * 3.14159265f * 14.0f
+                ) * 0.5f + 0.5f;
+
+            const float turbulence =
+                fbm(u * 9.0f + 40.0f, v * 9.0f, seed + 555u, 4);
+
+            Color color = lerpColor(bandLight, bandDark, band);
+            color = lerpColor(color, base, 0.25f + 0.4f * turbulence);
+
+            pixels[y * width + x] = color;
+        }
+    }
+
+    Image image{};
+    image.data = pixels;
+    image.width = width;
+    image.height = height;
+    image.mipmaps = 1;
+    image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+
+    return image;
+}
+
+/*
+ * Airless bodies (moons, Mercury-like planets): mottled gray/brown
+ * albedo variation with a scattering of stamped circular craters -
+ * a bright rim, a slightly darkened floor.
+ */
+Image buildCrateredImage(
+    Color base,
+    std::uint32_t seed
+)
+{
+    constexpr int width = 256;
+    constexpr int height = 128;
+
+    Color* pixels =
+        static_cast<Color*>(
+            RL_MALLOC(
+                static_cast<size_t>(width) *
+                static_cast<size_t>(height) *
+                sizeof(Color)
+            )
+        );
+
+    for (int y = 0; y < height; ++y)
+    {
+        const float v = static_cast<float>(y) / height;
+
+        for (int x = 0; x < width; ++x)
+        {
+            const float u = static_cast<float>(x) / width;
+
+            const float n = fbm(u * 10.0f, v * 10.0f, seed, 4);
+
+            pixels[y * width + x] =
+                lerpColor(
+                    lerpColor(base, BLACK, 0.35f),
+                    lerpColor(base, WHITE, 0.25f),
+                    n
+                );
+        }
+    }
+
+    constexpr int craterCount = 22;
+
+    for (int k = 0; k < craterCount; ++k)
+    {
+        const float cx = hashNoise(k, 0, seed) * width;
+        const float cy = hashNoise(k, 1, seed) * height;
+        const float radius = 4.0f + hashNoise(k, 2, seed) * 14.0f;
+
+        const int minX = std::max(0, static_cast<int>(cx - radius - 2));
+        const int maxX = std::min(width - 1, static_cast<int>(cx + radius + 2));
+        const int minY = std::max(0, static_cast<int>(cy - radius - 2));
+        const int maxY = std::min(height - 1, static_cast<int>(cy + radius + 2));
+
+        for (int y = minY; y <= maxY; ++y)
+        {
+            for (int x = minX; x <= maxX; ++x)
+            {
+                const float dx = static_cast<float>(x) - cx;
+                const float dy = static_cast<float>(y) - cy;
+                const float d = std::sqrt(dx * dx + dy * dy);
+
+                if (d > radius)
+                    continue;
+
+                const float rim =
+                    std::abs(d - radius * 0.85f) < radius * 0.15f
+                        ? 0.25f
+                        : 0.0f;
+
+                const float floorShade =
+                    d < radius * 0.6f ? 0.15f : 0.0f;
+
+                const float shade = rim - floorShade;
+
+                Color& pixel = pixels[y * width + x];
+
+                pixel =
+                    lerpColor(
+                        pixel,
+                        shade > 0.0f ? WHITE : BLACK,
+                        std::abs(shade)
+                    );
+            }
+        }
+    }
+
+    Image image{};
+    image.data = pixels;
+    image.width = width;
+    image.height = height;
+    image.mipmaps = 1;
+    image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+
+    return image;
+}
+
+/*
+ * Stars: a granulated, self-luminous surface - fine bright/dark cells
+ * with a few larger darker blotches standing in for starspots.
+ */
+Image buildStarImage(
+    Color base,
+    std::uint32_t seed
+)
+{
+    constexpr int width = 256;
+    constexpr int height = 128;
+
+    Color* pixels =
+        static_cast<Color*>(
+            RL_MALLOC(
+                static_cast<size_t>(width) *
+                static_cast<size_t>(height) *
+                sizeof(Color)
+            )
+        );
+
+    const Color hot  = lerpColor(base, WHITE, 0.45f);
+    const Color cool = lerpColor(base, BLACK, 0.25f);
+
+    for (int y = 0; y < height; ++y)
+    {
+        const float v = static_cast<float>(y) / height;
+
+        for (int x = 0; x < width; ++x)
+        {
+            const float u = static_cast<float>(x) / width;
+
+            const float granulation =
+                fbm(u * 24.0f, v * 12.0f, seed, 4);
+
+            const float spots =
+                fbm(u * 6.0f + 17.0f, v * 6.0f, seed + 303u, 3);
+
+            const float t =
+                granulation -
+                std::max(0.0f, spots - 0.62f) * 1.5f;
+
+            pixels[y * width + x] = lerpColor(cool, hot, t);
+        }
+    }
+
+    Image image{};
+    image.data = pixels;
+    image.width = width;
+    image.height = height;
+    image.mipmaps = 1;
+    image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+
+    return image;
+}
+
 } // namespace
 
 /*
@@ -251,6 +665,25 @@ Renderer::Renderer()
 
     camera.fovy = 45.0f;
     camera.projection = CAMERA_PERSPECTIVE;
+}
+
+Renderer::~Renderer()
+{
+    for (auto& [body, texture] : planetTextures)
+    {
+        (void)body;
+        UnloadTexture(texture);
+    }
+
+    if (shaderReady)
+    {
+        /*
+         * UnloadModel also releases the mesh it owns, so unitSphereMesh
+         * must not be unloaded separately here.
+         */
+        UnloadModel(unitSphereModel);
+        UnloadShader(planetShader);
+    }
 }
 
 /*
@@ -586,6 +1019,230 @@ Color Renderer::toRaylibColor(
 
 /*
  * ======================================================================
+ * Surface shading
+ * ======================================================================
+ */
+
+void Renderer::ensureShaderLoaded()
+{
+    if (shaderReady)
+        return;
+
+    planetShader =
+        LoadShader(
+            "shaders/planet.vs",
+            "shaders/planet.fs"
+        );
+
+    /*
+     * matModel and matNormal are not among raylib's automatically
+     * resolved default uniforms, so their locations have to be looked
+     * up and stored explicitly - once that's done, rlgl fills them in
+     * for every DrawModel call without any further work here.
+     */
+    planetShader.locs[SHADER_LOC_MATRIX_MODEL] =
+        GetShaderLocation(planetShader, "matModel");
+
+    planetShader.locs[SHADER_LOC_MATRIX_NORMAL] =
+        GetShaderLocation(planetShader, "matNormal");
+
+    locLightPos = GetShaderLocation(planetShader, "lightPos");
+    locViewPos = GetShaderLocation(planetShader, "viewPos");
+    locTint = GetShaderLocation(planetShader, "tint");
+    locAmbientStrength = GetShaderLocation(planetShader, "ambientStrength");
+    locAtmosphereStrength = GetShaderLocation(planetShader, "atmosphereStrength");
+    locAtmosphereColor = GetShaderLocation(planetShader, "atmosphereColor");
+
+    /*
+     * A single unit sphere, reused for every body: DrawModel's scale
+     * parameter stretches it to each body's actual draw radius, so
+     * there's no need to regenerate geometry as bodies grow or shrink
+     * on screen.
+     */
+    unitSphereMesh = GenMeshSphere(1.0f, 64, 64);
+    unitSphereModel = LoadModelFromMesh(unitSphereMesh);
+    unitSphereModel.materials[0].shader = planetShader;
+
+    shaderReady = true;
+}
+
+Renderer::SurfaceStyle Renderer::classifyStyle(
+    const Body& body
+) const
+{
+    /*
+     * There's no per-body "type" or atmosphere data in the simulation
+     * model to draw on, so style is inferred from what is available:
+     * radius, and whether it orbits a planet rather than a star. This
+     * is a coarse heuristic - if Body gains real classification data
+     * (composition, atmosphere thickness, etc.) later, this is the
+     * function to replace.
+     */
+    constexpr double gasGiantRadiusKm = 20000.0;
+    constexpr double crateredRadiusKm = 3000.0;
+
+    if (body.getMu() >= minimumStellarMu)
+        return SurfaceStyle::Star;
+
+    if (body.getRadius() >= gasGiantRadiusKm)
+        return SurfaceStyle::GasGiant;
+
+    if (isMoon(body) || body.getRadius() < crateredRadiusKm)
+        return SurfaceStyle::Cratered;
+
+    return SurfaceStyle::Rocky;
+}
+
+Texture2D& Renderer::getOrCreateTexture(
+    const Body& body
+)
+{
+    const auto existing = planetTextures.find(&body);
+
+    if (existing != planetTextures.end())
+        return existing->second;
+
+    const std::uint32_t seed = seedFromName(body.getName());
+    const Color base = getBodyColor(body, 1.0f);
+
+    Image image;
+
+    switch (classifyStyle(body))
+    {
+        case SurfaceStyle::GasGiant:
+            image = buildGasGiantImage(base, seed);
+            break;
+
+        case SurfaceStyle::Cratered:
+            image = buildCrateredImage(base, seed);
+            break;
+
+        case SurfaceStyle::Star:
+            image = buildStarImage(base, seed);
+            break;
+
+        default:
+            image = buildRockyImage(base, seed);
+            break;
+    }
+
+    Texture2D texture = LoadTextureFromImage(image);
+    UnloadImage(image);
+
+    GenTextureMipmaps(&texture);
+    SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
+
+    const auto [inserted, didInsert] =
+        planetTextures.emplace(&body, texture);
+
+    (void)didInsert;
+
+    return inserted->second;
+}
+
+const Body* Renderer::findRootStar(
+    const Body& body
+) const
+{
+    /*
+     * Walk up until we reach something star-sized (or run out of
+     * parents). A planet finds its star; a star finds itself - which
+     * matters in a galaxy-scale system, where the tree root is the
+     * galactic centre and is not what lights anything.
+     */
+    const Body* current = &body;
+
+    while (current->getMu() < minimumStellarMu && current->getParent())
+        current = current->getParent();
+
+    return current;
+}
+
+void Renderer::drawShadedBody(
+    const BodyVisual& visual
+)
+{
+    ensureShaderLoaded();
+
+    const Body& body = *visual.body;
+
+    Texture2D& texture = getOrCreateTexture(body);
+
+    unitSphereModel.materials[0]
+        .maps[MATERIAL_MAP_DIFFUSE]
+        .texture = texture;
+
+    const Body* star = findRootStar(body);
+    const bool isStar = (star == &body);
+
+    /*
+     * A star lights itself: the exact direction doesn't matter because
+     * ambientStrength is 1.0 for a star, which zeroes out the diffuse
+     * term's contribution below - but the direction still has to be a
+     * well-defined, non-zero vector or the shader's normalize() would
+     * produce NaNs.
+     */
+    const Vector3 lightPosition =
+        isStar
+            ? Vector3{
+                  visual.position.x + 1.0f,
+                  visual.position.y,
+                  visual.position.z
+              }
+            : toScene(star->getPosition());
+
+    const Color color = getBodyColor(body, 1.0f);
+
+    /*
+     * White on purpose: the texture was already generated from the
+     * body's color, so tinting by it again would square the color and
+     * render everything darker than intended.
+     */
+    const float tint[3] = {1.0f, 1.0f, 1.0f};
+    (void)color;
+
+    const float lightPos[3] = {
+        lightPosition.x,
+        lightPosition.y,
+        lightPosition.z
+    };
+
+    const float viewPos[3] = {
+        camera.position.x,
+        camera.position.y,
+        camera.position.z
+    };
+
+    const float ambient = isStar ? 1.0f : 0.06f;
+
+    const float atmosphereStrength =
+        isStar
+            ? 0.0f
+            : classifyStyle(body) == SurfaceStyle::GasGiant
+                  ? 0.35f
+                  : classifyStyle(body) == SurfaceStyle::Cratered
+                        ? 0.02f
+                        : 0.22f;
+
+    const float atmosphereColor[3] = {0.55f, 0.7f, 1.0f};
+
+    SetShaderValue(planetShader, locLightPos, lightPos, SHADER_UNIFORM_VEC3);
+    SetShaderValue(planetShader, locViewPos, viewPos, SHADER_UNIFORM_VEC3);
+    SetShaderValue(planetShader, locTint, tint, SHADER_UNIFORM_VEC3);
+    SetShaderValue(planetShader, locAmbientStrength, &ambient, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(planetShader, locAtmosphereStrength, &atmosphereStrength, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(planetShader, locAtmosphereColor, atmosphereColor, SHADER_UNIFORM_VEC3);
+
+    DrawModel(
+        unitSphereModel,
+        visual.position,
+        static_cast<float>(visual.drawRadius),
+        WHITE
+    );
+}
+
+/*
+ * ======================================================================
  * Selection
  * ======================================================================
  */
@@ -707,7 +1364,7 @@ void Renderer::updateCamera(
         std::clamp(
             cameraDistance,
             getMinimumCameraDistance(),
-            unitsPerAu * 200.0
+            maxCameraDistance
         );
 
     updateOrbitCamera();
@@ -770,7 +1427,7 @@ void Renderer::focusBody(
         std::clamp(
             cameraDistance,
             getMinimumCameraDistance(),
-            unitsPerAu * 200.0
+            maxCameraDistance
         );
 
     updateOrbitCamera();
@@ -875,6 +1532,26 @@ void Renderer::draw(
 
     for (const BodyVisual& visual : visuals)
     {
+        /*
+         * Lit, textured spheres are worth their cost only once a body
+         * is both large enough on screen to show detail and already
+         * drawn at its real physical size - a marker-scale dot a few
+         * pixels wide gains nothing from a surface texture. Fading
+         * bodies are left on the flat path too, since interpolating a
+         * shaded material's alpha would need blending changes this
+         * shader doesn't do.
+         */
+        const bool useShading =
+            visual.realScale &&
+            visual.screenRadius >= textureLodPixels &&
+            visual.alpha >= 0.999f;
+
+        if (useShading)
+        {
+            drawShadedBody(visual);
+            continue;
+        }
+
         const Color color =
             getBodyColor(*visual.body, visual.alpha);
 

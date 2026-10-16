@@ -1,12 +1,6 @@
-//
-// Created by tdragon on 9/17/26.
-//
-
-#ifndef MARYSFLIGHTS_RENDERER_H
-#define MARYSFLIGHTS_RENDERER_H
-
 #pragma once
 
+#include <unordered_map>
 #include <vector>
 
 #include "../simulation/Simulation.h"
@@ -16,6 +10,14 @@ class Renderer
 {
 public:
     Renderer();
+    ~Renderer();
+
+    /*
+     * Textures and GPU resources are owned by this object and are not
+     * safe to copy or move without extra bookkeeping.
+     */
+    Renderer(const Renderer&) = delete;
+    Renderer& operator=(const Renderer&) = delete;
 
     void draw(
         const Simulation& simulation
@@ -78,8 +80,8 @@ private:
      * on-screen size. That is the "switch to visual scale" behaviour.
      */
 
-    static constexpr double planetMarkerPixels = 5.5;
-    static constexpr double moonMarkerPixels = 3.0;
+    static constexpr double planetMarkerPixels = 3.5;
+    static constexpr double moonMarkerPixels = 2.0;
 
     /*
      * A moon is only worth drawing once it is far enough from its
@@ -107,6 +109,49 @@ private:
      */
     static constexpr double cameraUnitDistance = 1.0;
     static constexpr double maxRenderDepth = 400.0;
+
+    /*
+     * Furthest the camera may zoom out, in world units. 2e10 AU is about
+     * 97 kpc - enough to frame the whole Milky Way - while the double
+     * precision subtraction in toScene() keeps close-up views exact.
+     */
+    static constexpr double maxCameraDistance = unitsPerAu * 2.0e10;
+
+    /*
+     * Anything with at least this gravitational parameter (0.07 solar
+     * masses, roughly the hydrogen-burning limit) is treated as a star:
+     * self-lit, and the light source for whatever orbits it.
+     */
+    static constexpr double minimumStellarMu = 0.07 * 1.32712440018e11;
+
+    /*
+     * ------------------------------------------------------------------
+     * Surface shading configuration
+     * ------------------------------------------------------------------
+     *
+     * Below this on-screen radius a body is drawn as a flat-shaded dot,
+     * same as before - not worth the cost of a lit, textured sphere when
+     * it is only a handful of pixels wide. Above it, and only once the
+     * body has crossed into real-scale rendering, it gets a lit,
+     * procedurally-textured sphere instead.
+     */
+    static constexpr double textureLodPixels = 22.0;
+
+    /*
+     * Procedural texture resolution. Equirectangular (longitude x
+     * latitude); 256x128 is plenty for anything short of a close, full
+     * screen surface flyby.
+     */
+    static constexpr int textureWidth = 256;
+    static constexpr int textureHeight = 128;
+
+    enum class SurfaceStyle
+    {
+        Rocky,
+        GasGiant,
+        Cratered,
+        Star
+    };
 
     /*
      * ------------------------------------------------------------------
@@ -145,6 +190,36 @@ private:
     float orbitPitch;
 
     std::vector<BodyVisual> visuals;
+
+    /*
+     * ------------------------------------------------------------------
+     * Shading resources
+     * ------------------------------------------------------------------
+     *
+     * Loaded lazily on first use (ensureShaderLoaded) rather than in the
+     * constructor, since raylib's GPU calls require an open window/GL
+     * context, which may not exist yet when Renderer is constructed.
+     */
+
+    bool shaderReady = false;
+
+    Shader planetShader{};
+    Mesh unitSphereMesh{};
+    Model unitSphereModel{};
+
+    int locLightPos = -1;
+    int locViewPos = -1;
+    int locTint = -1;
+    int locAmbientStrength = -1;
+    int locAtmosphereStrength = -1;
+    int locAtmosphereColor = -1;
+
+    /*
+     * One procedural texture per body, generated once and cached for
+     * the process lifetime. Keyed by pointer since Body identities are
+     * stable for the run of the program.
+     */
+    std::unordered_map<const Body*, Texture2D> planetTextures;
 
     /*
      * ------------------------------------------------------------------
@@ -208,6 +283,38 @@ private:
 
     /*
      * ------------------------------------------------------------------
+     * Surface shading
+     * ------------------------------------------------------------------
+     */
+
+    void ensureShaderLoaded();
+
+    [[nodiscard]] SurfaceStyle classifyStyle(
+        const Body& body
+    ) const;
+
+    /*
+     * Returns the cached procedural texture for this body, generating
+     * and uploading it the first time the body is asked for.
+     */
+    [[nodiscard]] Texture2D& getOrCreateTexture(
+        const Body& body
+    );
+
+    /*
+     * Walks up the parent chain to the body with no parent - the host
+     * star for anything in a real system file. Used as the light source.
+     */
+    [[nodiscard]] const Body* findRootStar(
+        const Body& body
+    ) const;
+
+    void drawShadedBody(
+        const BodyVisual& visual
+    );
+
+    /*
+     * ------------------------------------------------------------------
      * Rendering
      * ------------------------------------------------------------------
      */
@@ -220,5 +327,3 @@ private:
 
     [[nodiscard]] double getMinimumCameraDistance() const;
 };
-
-#endif //MARYSFLIGHTS_RENDERER_H
